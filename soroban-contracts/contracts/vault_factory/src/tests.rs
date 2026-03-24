@@ -1,13 +1,12 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Events},
+    testutils::{Address as _, Events as _},
     Address, BytesN, Env, IntoVal, String,
 };
 
 use crate::{
-    errors::Error,
-    storage::{delete_vault_info, get_all_vaults, get_single_rwa_vaults, get_vault_info,
+    storage::{get_all_vaults, get_single_rwa_vaults, get_vault_info,
               push_all_vaults, push_single_rwa_vaults, put_vault_info},
     types::{VaultInfo, VaultType},
     VaultFactory, VaultFactoryClient,
