@@ -2,6 +2,7 @@
 
 mod errors;
 mod events;
+mod math;
 mod storage;
 mod token_interface;
 mod types;
@@ -650,7 +651,7 @@ impl SingleRWAVault {
         if total_shares == 0 || user_shares == 0 {
             return 0;
         }
-        (get_epoch_yield(e, epoch) * user_shares) / total_shares
+        math::mul_div(e, get_epoch_yield(e, epoch), user_shares, total_shares)
     }
 
     pub fn current_epoch(e: &Env) -> u32 {
@@ -992,7 +993,7 @@ impl SingleRWAVault {
 
         let assets = preview_redeem(e, req.shares);
         let fee_bps = get_early_redemption_fee_bps(e) as i128;
-        let fee = (assets * fee_bps) / 10000;
+        let fee = math::mul_div(e, assets, fee_bps, 10000);
         let net_assets = assets - fee;
         put_total_deposited(e, get_total_deposited(e) - net_assets);
 
@@ -1376,7 +1377,7 @@ fn preview_deposit(e: &Env, assets: i128) -> i128 {
         return assets;
     }
     // shares = assets * totalSupply / totalAssets
-    assets * supply / ta
+    math::mul_div(e, assets, supply, ta)
 }
 
 fn preview_mint(e: &Env, shares: i128) -> i128 {
@@ -1386,7 +1387,7 @@ fn preview_mint(e: &Env, shares: i128) -> i128 {
         return shares;
     }
     // assets = shares * totalAssets / totalSupply  (ceil)
-    (shares * ta + supply - 1) / supply
+    math::mul_div_ceil(e, shares, ta, supply)
 }
 
 fn preview_withdraw(e: &Env, assets: i128) -> i128 {
@@ -1396,7 +1397,7 @@ fn preview_withdraw(e: &Env, assets: i128) -> i128 {
         return assets;
     }
     // shares = assets * totalSupply / totalAssets  (ceil)
-    (assets * supply + ta - 1) / ta
+    math::mul_div_ceil(e, assets, supply, ta)
 }
 
 fn preview_redeem(e: &Env, shares: i128) -> i128 {
@@ -1412,7 +1413,7 @@ fn preview_redeem(e: &Env, shares: i128) -> i128 {
     // _burn subtracts from total_supply.
     // My request_early_redemption does NOT _burn, so total_supply is unchanged.
     // So total_supply ALREADY includes escrowed shares.
-    shares * ta / supply
+    math::mul_div(e, shares, ta, supply)
 }
 
 fn asset_balance_of_vault(e: &Env) -> i128 {
@@ -1745,6 +1746,8 @@ mod tests;
 mod test_close_vault;
 #[cfg(test)]
 mod test_constructor_validation;
+#[cfg(test)]
+mod test_overflow;
 #[cfg(test)]
 mod test_rwa_setters;
 #[cfg(test)]
