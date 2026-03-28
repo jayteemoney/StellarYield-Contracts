@@ -56,4 +56,14 @@ pub enum Error {
     /// Burn requires pending yield to be claimed first (Option A).
     BurnRequiresYieldClaim = 32,
     InvalidDepositLimits = 33,
+    /// Timelock action not found or invalid.
+    TimelockActionNotFound = 34,
+    /// Timelock delay has not passed yet.
+    TimelockDelayNotPassed = 35,
+    /// Timelock action has already been executed.
+    TimelockActionAlreadyExecuted = 36,
+    /// Timelock action has been cancelled.
+    TimelockActionCancelled = 37,
+    /// Only admin can perform timelock operations.
+    TimelockAdminOnly = 38,
 }
