@@ -12,6 +12,9 @@ fn test_multiple_deposit_times() {
     let user_a = Address::generate(env);
     let user_b = Address::generate(env);
 
+    // Set funding target to 1M to match the test deposit
+    ctx.vault().set_funding_target(&ctx.admin, &1_000_000i128);
+
     // User A deposits early (1:1 price)
     mint_usdc(env, &ctx.asset_id, &user_a, 1_000_000);
     ctx.vault().deposit(&user_a, &1_000_000i128, &user_a);
