@@ -35,6 +35,10 @@ mod test_epoch_history;
 #[cfg(test)]
 mod test_escrow;
 #[cfg(test)]
+mod test_events;
+#[cfg(test)]
+mod test_fee_on_transfer;
+#[cfg(test)]
 mod test_freeze_flags;
 #[cfg(test)]
 mod test_funding_deadline;
@@ -42,6 +46,8 @@ mod test_funding_deadline;
 mod test_helpers;
 #[cfg(test)]
 mod test_lifecycle;
+#[cfg(test)]
+mod test_multiple_deposit_times;
 #[cfg(test)]
 mod test_multisig_emergency;
 #[cfg(test)]
@@ -58,6 +64,8 @@ mod test_token;
 mod test_vault_state_guards;
 #[cfg(test)]
 mod test_withdraw;
+#[cfg(test)]
+mod test_yield_vesting;
 #[cfg(test)]
 mod tests;
 
@@ -92,6 +100,7 @@ impl SingleRWAVault {
 
     /// Timeout for emergency proposals: 24 hours in seconds.
     pub const EMERGENCY_PROPOSAL_TIMEOUT: u64 = 86400;
+    pub const MAX_TRANSFER_EXEMPTIONS: u32 = crate::storage::MAX_TRANSFER_EXEMPTIONS;
 
     // ─────────────────────────────────────────────────────────────────
     // Constructor
@@ -153,6 +162,7 @@ impl SingleRWAVault {
         put_min_deposit(e, params.min_deposit);
         put_max_deposit_per_user(e, params.max_deposit_per_user);
         put_early_redemption_fee_bps(e, params.early_redemption_fee_bps);
+        put_yield_vesting_period(e, params.yield_vesting_period);
 
         // Initial state
         put_vault_state(e, VaultState::Funding);
@@ -321,8 +331,7 @@ impl SingleRWAVault {
         require_current_schema(e);
         acquire_lock(e);
         require_not_frozen(e, Self::FREEZE_DEPOSIT_MINT);
-        require_not_blacklisted(e, &caller);
-        require_not_blacklisted(e, &receiver);
+        require_not_blacklisted_deposit_parties(e, &caller, &receiver);
         require_kyc_verified(e, &caller);
         require_active_or_funding(e);
 
@@ -376,8 +385,7 @@ impl SingleRWAVault {
         require_current_schema(e);
         acquire_lock(e);
         require_not_frozen(e, Self::FREEZE_DEPOSIT_MINT);
-        require_not_blacklisted(e, &caller);
-        require_not_blacklisted(e, &receiver);
+        require_not_blacklisted_deposit_parties(e, &caller, &receiver);
         require_kyc_verified(e, &caller);
         require_active_or_funding(e);
 
@@ -442,9 +450,7 @@ impl SingleRWAVault {
         require_current_schema(e);
         acquire_lock(e);
         require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
-        require_not_blacklisted(e, &caller);
-        require_not_blacklisted(e, &owner);
-        require_not_blacklisted(e, &receiver);
+        require_not_blacklisted_withdraw_parties(e, &caller, &owner, &receiver);
         require_active_or_matured(e);
 
         if assets <= 0 {
@@ -497,9 +503,7 @@ impl SingleRWAVault {
         require_current_schema(e);
         acquire_lock(e);
         require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
-        require_not_blacklisted(e, &caller);
-        require_not_blacklisted(e, &owner);
-        require_not_blacklisted(e, &receiver);
+        require_not_blacklisted_withdraw_parties(e, &caller, &owner, &receiver);
         require_active_or_matured(e);
 
         if shares <= 0 {
@@ -765,25 +769,41 @@ impl SingleRWAVault {
         require_active_or_matured(e);
         require_not_blacklisted(e, &caller);
 
-        if get_has_claimed_epoch(e, &caller, epoch) {
-            panic_with_error!(e, Error::NoYieldToClaim);
-        }
-
         let amount = Self::pending_yield_for_epoch(e, caller.clone(), epoch);
         if amount <= 0 {
             panic_with_error!(e, Error::NoYieldToClaim);
         }
 
         // --- Effects ---
-        put_has_claimed_epoch(e, &caller, epoch, true);
-        // Advance the cursor: if this epoch is the next sequential one after
-        // the cursor, walk forward over any already-claimed epochs too.
-        let mut cursor = get_last_claimed_epoch(e, &caller);
-        let current = get_current_epoch(e);
-        while cursor < current && get_has_claimed_epoch(e, &caller, cursor + 1) {
-            cursor += 1;
+        // Update the amount claimed for this specific epoch
+        let already_claimed = get_user_epoch_yield_claimed(e, &caller, epoch);
+        put_user_epoch_yield_claimed(e, &caller, epoch, already_claimed + amount);
+
+        // Check if this epoch is now fully claimed
+        let total_yield_for_user = {
+            let user_shares = _get_user_shares_for_epoch(e, &caller, epoch);
+            let total_shares = get_epoch_total_shares(e, epoch);
+            if total_shares == 0 || user_shares == 0 {
+                0
+            } else {
+                math::mul_div(e, get_epoch_yield(e, epoch), user_shares, total_shares)
+            }
+        };
+
+        let new_total_claimed = already_claimed + amount;
+        if new_total_claimed >= total_yield_for_user {
+            // Epoch is fully claimed - mark as claimed for cursor optimization
+            put_has_claimed_epoch(e, &caller, epoch, true);
+
+            // Advance the cursor: if this epoch is the next sequential one after
+            // the cursor, walk forward over any already-claimed epochs too.
+            let mut cursor = get_last_claimed_epoch(e, &caller);
+            let current = get_current_epoch(e);
+            while cursor < current && get_has_claimed_epoch(e, &caller, cursor + 1) {
+                cursor += 1;
+            }
+            put_last_claimed_epoch(e, &caller, cursor);
         }
-        put_last_claimed_epoch(e, &caller, cursor);
 
         put_total_yield_claimed(e, &caller, get_total_yield_claimed(e, &caller) + amount);
         transfer_asset_from_vault(e, &caller, amount);
@@ -817,7 +837,51 @@ impl SingleRWAVault {
         if total_shares == 0 || user_shares == 0 {
             return 0;
         }
-        math::mul_div(e, get_epoch_yield(e, epoch), user_shares, total_shares)
+
+        // Calculate total yield for user in this epoch
+        let total_yield_for_user =
+            math::mul_div(e, get_epoch_yield(e, epoch), user_shares, total_shares);
+
+        // Get vesting period (0 = instant claiming for backward compatibility)
+        let vesting_period = get_yield_vesting_period(e);
+        if vesting_period == 0 {
+            // No vesting - return full amount
+            return total_yield_for_user;
+        }
+
+        // Get when this epoch was distributed
+        let epoch_timestamp = get_epoch_timestamp(e, epoch);
+        if epoch_timestamp == 0 {
+            // Epoch timestamp not set (shouldn't happen with proper initialization)
+            return total_yield_for_user;
+        }
+
+        // Calculate vested portion
+        let now = e.ledger().timestamp();
+        if now <= epoch_timestamp {
+            // Distribution just happened - nothing vested yet
+            return 0;
+        }
+
+        let elapsed = now - epoch_timestamp;
+        let vested_fraction = if elapsed >= vesting_period {
+            // Fully vested
+            1_000_000_000 // Use 1e9 for precision
+        } else {
+            // Partially vested - use integer math: (elapsed * 1e9) / vesting_period
+            (elapsed * 1_000_000_000) / vesting_period
+        };
+
+        // Calculate vested amount: (total_yield * vested_fraction) / 1e9
+        let vested_amount = (total_yield_for_user * vested_fraction as i128) / 1_000_000_000i128;
+
+        // Subtract already claimed amount for this epoch
+        let already_claimed = get_user_epoch_yield_claimed(e, &user, epoch);
+        if vested_amount <= already_claimed {
+            return 0;
+        }
+
+        vested_amount - already_claimed
     }
 
     pub fn current_epoch(e: &Env) -> u32 {
@@ -1218,9 +1282,7 @@ impl SingleRWAVault {
         // --- Checks ---
         acquire_lock(e);
         require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
-        require_not_blacklisted(e, &caller);
-        require_not_blacklisted(e, &owner);
-        require_not_blacklisted(e, &receiver);
+        require_not_blacklisted_withdraw_parties(e, &caller, &owner, &receiver);
         require_state(e, VaultState::Matured);
 
         if shares <= 0 {
@@ -1326,21 +1388,6 @@ impl SingleRWAVault {
     /// Security: follows CEI — the request is marked processed and shares are
     /// burned from escrow (Effects) before the asset transfer (Interaction).
     /// Reentrancy lock prevents reentrant calls from processing the same request twice.
-    ///
-    /// # Errors
-    ///
-    /// - `Error::InvalidVaultState`: if the vault is not in `Active` state.
-    ///
-    /// # State
-    ///
-    /// - Requires `VaultState::Active`.
-    ///
-    /// # Transition Behavior
-    ///
-    /// - If the vault has already transitioned to `Matured`, the operator is
-    ///   blocked from processing the early redemption request.
-    /// - Users should use `redeem_at_maturity` instead, which applies a zero
-    ///   early exit fee.
     pub fn process_early_redemption(e: &Env, operator: Address, request_id: u32) {
         operator.require_auth();
         // --- Checks ---
@@ -1348,8 +1395,7 @@ impl SingleRWAVault {
         // LifecycleManager role required — also passes for FullOperator and admin.
         require_role(e, &operator, Role::LifecycleManager);
 
-        // --- State ---
-        // Block processing in Matured state; users should use redeem_at_maturity.
+        // Guard: Only active vaults can process early redemptions
         require_state(e, VaultState::Active);
 
         let mut req = get_redemption_request(e, request_id);
@@ -1470,6 +1516,16 @@ impl SingleRWAVault {
         bump_instance(e);
     }
 
+    pub fn set_yield_vesting_period(e: &Env, operator: Address, vesting_period: u64) {
+        operator.require_auth();
+        // LifecycleManager role required — also passes for FullOperator and admin.
+        require_role(e, &operator, Role::LifecycleManager);
+        require_not_closed(e);
+        put_yield_vesting_period(e, vesting_period);
+        emit_yield_vesting_period_set(e, vesting_period);
+        bump_instance(e);
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Access control
     // ─────────────────────────────────────────────────────────────────
@@ -1523,9 +1579,9 @@ impl SingleRWAVault {
         get_operator(e, &account)
     }
 
-    pub fn transfer_admin(e: &Env, admin: Address, _new_admin: Address) {
-        admin.require_auth();
-        require_admin(e, &admin);
+    pub fn transfer_admin(e: &Env, caller: Address, _new_admin: Address) {
+        caller.require_auth();
+        require_admin(e, &caller);
 
         // Transfer admin requires timelock - use propose_action instead
         panic_with_error!(e, Error::TimelockAdminOnly);
@@ -1587,32 +1643,14 @@ impl SingleRWAVault {
             panic_with_error!(e, Error::TimelockDelayNotPassed);
         }
 
-        // Execute the action based on its type
         match action.action_type {
-            ActionType::EmergencyWithdraw => {
-                // For now, we'll implement a simplified version
-                // TODO: Implement proper data deserialization when needed
-                panic_with_error!(e, Error::NotSupported);
-            }
-            ActionType::TransferAdmin => {
-                // For now, we'll implement a simplified version
-                // TODO: Implement proper data deserialization when needed
-                panic_with_error!(e, Error::NotSupported);
-            }
-            ActionType::Upgrade => {
-                // TODO: Implement upgrade functionality when needed
-                panic_with_error!(e, Error::NotSupported);
-            }
-            ActionType::WasmHashUpdate => {
-                // TODO: Implement WASM hash update functionality when needed
+            ActionType::EmergencyWithdraw
+            | ActionType::TransferAdmin
+            | ActionType::Upgrade
+            | ActionType::WasmHashUpdate => {
                 panic_with_error!(e, Error::NotSupported);
             }
         }
-
-        /*
-        emit_action_executed(e, action_id, action.action_type);
-        bump_instance(e);
-        */
     }
 
     /// Cancel a pending timelock action.
@@ -1642,8 +1680,8 @@ impl SingleRWAVault {
         crate::storage::get_timelock_action(e, action_id)
     }
 
-    #[allow(dead_code)]
     /// Internal emergency withdraw function (bypasses timelock when paused).
+    #[allow(dead_code)]
     fn emergency_withdraw_internal(e: &Env, recipient: Address, amount: i128) {
         if amount <= 0 {
             panic_with_error!(e, Error::ZeroAmount);
@@ -1693,6 +1731,23 @@ impl SingleRWAVault {
         require_role(e, &caller, Role::ComplianceOfficer);
         put_transfer_requires_kyc(e, enabled);
         bump_instance(e);
+    }
+
+    /// Admin-only transfer restriction exemption for designated market makers.
+    pub fn set_transfer_exempt(e: &Env, caller: Address, address: Address, exempt: bool) {
+        caller.require_auth();
+        require_admin(e, &caller);
+        put_transfer_exempt(e, &address, exempt);
+        emit_transfer_exemption_set(e, address, exempt);
+        bump_instance(e);
+    }
+
+    pub fn is_transfer_exempt(e: &Env, address: Address) -> bool {
+        get_transfer_exempt(e, &address)
+    }
+
+    pub fn get_transfer_exempt_addresses(e: &Env) -> Vec<Address> {
+        crate::storage::get_transfer_exempt_addresses(e)
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -2062,7 +2117,7 @@ impl SingleRWAVault {
             return get_expected_apy(e);
         }
         const SECONDS_PER_YEAR: u64 = 31_536_000;
-        let numerator = (ytd as i128)
+        let numerator = ytd
             .checked_mul(SECONDS_PER_YEAR as i128)
             .and_then(|v| v.checked_mul(10000))
             .unwrap_or(i128::MAX);
@@ -2113,7 +2168,9 @@ impl SingleRWAVault {
     }
 
     pub fn balance(e: &Env, id: Address) -> i128 {
-        get_share_balance(e, &id)
+        let bal = get_share_balance(e, &id);
+        bump_balance(e, &id);
+        bal
     }
 
     pub fn escrowed_balance(e: &Env, id: Address) -> i128 {
@@ -2122,13 +2179,8 @@ impl SingleRWAVault {
 
     pub fn transfer(e: &Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
-        require_not_blacklisted(e, &from);
-        require_not_blacklisted(e, &to);
-        if get_transfer_requires_kyc(e) {
-            require_kyc_verified(e, &to);
-        }
-        update_user_snapshot(e, &from);
-        update_user_snapshot(e, &to);
+        require_transfer_parties_allowed(e, &from, &to);
+        update_user_snapshots_for_transfer(e, &from, &to);
         spend_share_balance(e, &from, amount);
         receive_share_balance(e, &to, amount);
         emit_transfer(e, from, to, amount);
@@ -2138,13 +2190,8 @@ impl SingleRWAVault {
     pub fn transfer_from(e: &Env, spender: Address, from: Address, to: Address, amount: i128) {
         spender.require_auth();
         require_not_blacklisted(e, &spender);
-        require_not_blacklisted(e, &from);
-        require_not_blacklisted(e, &to);
-        if get_transfer_requires_kyc(e) {
-            require_kyc_verified(e, &to);
-        }
-        update_user_snapshot(e, &from);
-        update_user_snapshot(e, &to);
+        require_transfer_parties_allowed(e, &from, &to);
+        update_user_snapshots_for_transfer(e, &from, &to);
         let allowance = get_share_allowance(e, &from, &spender);
         if allowance < amount {
             panic_with_error!(e, Error::InsufficientAllowance);
@@ -2337,6 +2384,13 @@ fn update_user_snapshot(e: &Env, user: &Address) {
     bump_balance(e, user);
 }
 
+/// Refresh snapshots for both parties before moving shares (`transfer` / `transfer_from`).
+/// Order is `from` then `to` so each records their pre-transfer balance for epoch yield.
+fn update_user_snapshots_for_transfer(e: &Env, from: &Address, to: &Address) {
+    update_user_snapshot(e, from);
+    update_user_snapshot(e, to);
+}
+
 fn _get_user_shares_for_epoch(e: &Env, user: &Address, epoch: u32) -> i128 {
     if get_has_snapshot_for_epoch(e, user, epoch) {
         get_user_shares_at_epoch(e, user, epoch)
@@ -2429,6 +2483,43 @@ fn require_not_blacklisted(e: &Env, addr: &Address) {
     if get_blacklisted(e, addr) {
         panic_with_error!(e, Error::AddressBlacklisted);
     }
+}
+
+fn transfer_restrictions_exempt(e: &Env, from: &Address, to: &Address) -> bool {
+    get_transfer_exempt(e, from) || get_transfer_exempt(e, to)
+}
+
+fn require_transfer_parties_allowed(e: &Env, from: &Address, to: &Address) {
+    // Blacklist enforcement is the compliance override and is never bypassed.
+    require_not_blacklisted(e, from);
+    require_not_blacklisted(e, to);
+
+    if transfer_restrictions_exempt(e, from, to) {
+        return;
+    }
+
+    if get_transfer_requires_kyc(e) {
+        require_kyc_verified(e, to);
+    }
+
+    // Future transfer lock-up checks should live here so the exemption path
+    // stays shared across all transfer restrictions except blacklist.
+}
+
+fn require_not_blacklisted_deposit_parties(e: &Env, caller: &Address, receiver: &Address) {
+    require_not_blacklisted(e, caller);
+    require_not_blacklisted(e, receiver);
+}
+
+fn require_not_blacklisted_withdraw_parties(
+    e: &Env,
+    caller: &Address,
+    owner: &Address,
+    receiver: &Address,
+) {
+    require_not_blacklisted(e, caller);
+    require_not_blacklisted(e, owner);
+    require_not_blacklisted(e, receiver);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2524,7 +2615,8 @@ mod test {
             rwa_document_uri: String::from_str(e, "https://example.com/doc"),
             rwa_category: String::from_str(e, "Bonds"),
             expected_apy: 500,
-            timelock_delay: 172800u64, // 48 hours
+            timelock_delay: 172800u64,  // 48 hours
+            yield_vesting_period: 0u64, // Default to 0 for instant claiming
         };
 
         let vault_addr = e.register(SingleRWAVault, (params,));

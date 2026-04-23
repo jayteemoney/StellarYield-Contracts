@@ -32,6 +32,7 @@ fn default_params(env: &Env, admin: &Address, asset: &Address) -> InitParams {
         rwa_category: String::from_str(env, "Real Estate"),
         expected_apy: 500_u32,
         timelock_delay: 172800u64, // 48 hours
+        yield_vesting_period: 0u64,
     }
 }
 
@@ -244,6 +245,18 @@ fn test_compliance_officer_can_set_zkme_verifier() {
     client.grant_role(&admin, &co, &Role::ComplianceOfficer);
     // Should not panic.
     client.set_zkme_verifier(&co, &new_verifier);
+}
+
+#[test]
+#[should_panic]
+fn test_compliance_officer_cannot_set_transfer_exempt() {
+    let (env, vault_id, _, admin) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let co = Address::generate(&env);
+    let target = Address::generate(&env);
+
+    client.grant_role(&admin, &co, &Role::ComplianceOfficer);
+    client.set_transfer_exempt(&co, &target, &true);
 }
 
 #[test]

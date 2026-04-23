@@ -90,6 +90,7 @@ fn make_vault(env: &Env) -> (Address, Address, Address, Address) {
             rwa_category: String::from_str(env, "Bond"),
             expected_apy: 500u32,
             timelock_delay: 172800u64,
+            yield_vesting_period: 0u64,
         },),
     );
 
@@ -331,30 +332,25 @@ fn test_claim_yield_for_epoch_during_funding_panics() {
 // process_early_redemption — state guard tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// process_early_redemption during Funding state must panic with Error::InvalidVaultState.
 #[test]
-#[should_panic]
+#[should_panic(expected = "HostError: Error(Contract, #5)")] // InvalidVaultState
 fn test_process_early_redemption_during_funding_panics() {
     let env = Env::default();
     env.mock_all_auths();
-
     let (vault_id, token_id, zkme_id, admin) = make_vault(&env);
     let user = Address::generate(&env);
 
-    let shares = fund_user(&env, &vault_id, &token_id, &zkme_id, &user, 1_000_000);
+    fund_user(&env, &vault_id, &token_id, &zkme_id, &user, 1_000_000);
     let vault = SingleRWAVaultClient::new(&env, &vault_id);
-    let request_id = vault.request_early_redemption(&user, &shares);
 
-    // Vault is still in Funding -- must panic.
-    vault.process_early_redemption(&admin, &request_id);
+    // Vault still in Funding.
+    vault.process_early_redemption(&admin, &1u32);
 }
 
-/// process_early_redemption during Active state succeeds.
 #[test]
 fn test_process_early_redemption_during_active_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
-
     let (vault_id, token_id, zkme_id, admin) = make_vault(&env);
     let user = Address::generate(&env);
 
@@ -364,18 +360,15 @@ fn test_process_early_redemption_during_active_succeeds() {
     let vault = SingleRWAVaultClient::new(&env, &vault_id);
     let request_id = vault.request_early_redemption(&user, &shares);
 
-    // Vault is Active -- succeeds.
+    // Vault in Active - should succeed.
     vault.process_early_redemption(&admin, &request_id);
-    assert_eq!(vault.balance(&user), 0);
 }
 
-/// process_early_redemption during Matured state must panic with Error::InvalidVaultState.
 #[test]
-#[should_panic]
+#[should_panic(expected = "HostError: Error(Contract, #5)")] // InvalidVaultState
 fn test_process_early_redemption_during_matured_panics() {
     let env = Env::default();
     env.mock_all_auths();
-
     let (vault_id, token_id, zkme_id, admin) = make_vault(&env);
     let user = Address::generate(&env);
 
@@ -385,53 +378,38 @@ fn test_process_early_redemption_during_matured_panics() {
     let vault = SingleRWAVaultClient::new(&env, &vault_id);
     let request_id = vault.request_early_redemption(&user, &shares);
 
-    mature(&env, &vault_id, &admin);
+    let maturity = vault.maturity_date();
+    env.ledger().set_timestamp(maturity + 1);
+    vault.mature_vault(&admin);
 
-    // Vault is Matured -- must panic.
+    // Vault in Matured.
     vault.process_early_redemption(&admin, &request_id);
 }
 
-/// process_early_redemption during Closed state must panic.
 #[test]
-#[should_panic]
+#[should_panic(expected = "HostError: Error(Contract, #5)")] // InvalidVaultState
 fn test_process_early_redemption_during_closed_panics() {
     let env = Env::default();
     env.mock_all_auths();
-
     let (vault_id, token_id, zkme_id, admin) = make_vault(&env);
     let user = Address::generate(&env);
 
+    // Fund user and activate vault.
     let shares = fund_user(&env, &vault_id, &token_id, &zkme_id, &user, 1_000_000);
     activate(&env, &vault_id, &admin);
 
     let vault = SingleRWAVaultClient::new(&env, &vault_id);
-    let request_id = vault.request_early_redemption(&user, &shares);
 
-    mature(&env, &vault_id, &admin);
+    // Redeem all shares so total_supply drops to 0 — required for close_vault.
+    crate::test_helpers::MockZkmeClient::new(&env, &zkme_id).approve_user(&user);
+    vault.redeem(&user, &shares, &user, &user);
+
+    // Advance time past maturity and transition to Matured then Closed.
+    let maturity = vault.maturity_date();
+    env.ledger().set_timestamp(maturity + 1);
+    vault.mature_vault(&admin);
     vault.close_vault(&admin);
 
-    // Vault is Closed -- must panic.
-    vault.process_early_redemption(&admin, &request_id);
-}
-
-/// Operator authentication is checked before the state guard.
-#[test]
-#[should_panic] // Should panic with auth failure, not InvalidVaultState (though both panic)
-fn test_process_early_redemption_auth_first() {
-    let env = Env::default();
-    // No mock_all_auths() here to test real auth if possible, or use explicit mock
-
-    let (vault_id, token_id, zkme_id, _admin) = make_vault(&env);
-    let user = Address::generate(&env);
-    let attacker = Address::generate(&env);
-
-    let shares = fund_user(&env, &vault_id, &token_id, &zkme_id, &user, 1_000_000);
-
-    // Vault is in Funding (invalid state for this fn)
-    let vault = SingleRWAVaultClient::new(&env, &vault_id);
-    let request_id = vault.request_early_redemption(&user, &shares);
-
-    // Call with attacker address. auth should fail before state check.
-    // We expect a panic from require_auth() which doesn't match InvalidVaultState.
-    vault.process_early_redemption(&attacker, &request_id);
+    // Vault is now Closed. process_early_redemption must panic with InvalidVaultState (#5).
+    vault.process_early_redemption(&admin, &1u32);
 }

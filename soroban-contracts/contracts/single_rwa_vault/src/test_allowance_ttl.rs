@@ -81,7 +81,7 @@ fn test_allowance_ttl_bumped_on_read() {
         .approve(&owner, &spender, &allowance_amount, &expiration_ledger);
 
     // Simulate many reads over time without writes
-    for _i in 0..200 {
+    for _ in 0..200 {
         ctx.env
             .ledger()
             .set_sequence_number(ctx.env.ledger().sequence() + 5);
@@ -151,7 +151,7 @@ fn test_allowance_persistence_vs_balance_consistency() {
         .approve(&user, &spender, &allowance_amount, &expiration_ledger);
 
     // Simulate long period with interactions
-    for _i in 0..10 {
+    for _ in 0..50 {
         ctx.env
             .ledger()
             .set_sequence_number(ctx.env.ledger().sequence() + 100);
